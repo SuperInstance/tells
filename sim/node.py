@@ -117,6 +117,8 @@ class Tell:
         self._claim_nonce = None
         self._session_pk = None
         self._pending_pair = None     # carries pair_key between CLAIM and KEY
+        self._pair_ctx = None         # last accepted ceremony, for idempotent
+                                     # re-ack/re-key when frames are lost
         self._claim_failures = 0
         self._lockout_until = 0.0
         self._seen_nonces = []
@@ -207,6 +209,7 @@ class Tell:
         self.fleet_id = None
         self.fleet_key = None
         self._pending_pair = None
+        self._pair_ctx = None
         self.peers.clear()
         self._rotate_address()
         self._log("fleet_revoked", why)
@@ -318,6 +321,32 @@ class Tell:
         if now < self._lockout_until:
             self._log("claim_ignored_lockout")
             return
+        c = frame.get("claim") or {}
+        ng, fid, pk = c.get("nonce"), c.get("fleet_id"), c.get("pk")
+        if not (isinstance(ng, str) and isinstance(fid, str) and isinstance(pk, str)):
+            self._log("claim_malformed")
+            return
+        # Radio frames get lost; the ceremony must be completable by
+        # retransmission.  A replay of the claim this node already accepted
+        # (same nonce/pk/fleet, valid proof under the then-secret) just
+        # re-acks -- it changes nothing a stranger could exploit, because
+        # producing that proof requires the per-device secret.
+        ctx = self._pair_ctx
+        if ctx is not None and (self.state == CLAIMED or self._pending_pair is not None):
+            if (ng, fid, pk) == (ctx["ng"], ctx["fid"], ctx["pk"]):
+                try:
+                    parts = (b"claim", bytes.fromhex(ng), fid.encode(),
+                             bytes.fromhex(pk))
+                except ValueError:
+                    parts = None
+                if parts is not None and mac_ok(ctx["secret"], parts,
+                                                c.get("proof", "")):
+                    self.radio.broadcast(self.id, {
+                        "type": "CLAIM_ACK", "fleet_id": fid,
+                        "proof": mac_tag(ctx["secret"], b"ack",
+                                         ctx["nonce"], bytes.fromhex(ng)).hex()})
+                    self._log("claim_replayed_reacked")
+                    return
         if self.state != UNCLAIMED:
             self._log("claim_ignored_claimed")
             return
@@ -325,15 +354,21 @@ class Tell:
             # THE button-window requirement: no press, no claim.
             self._log("claim_ignored_no_window")
             return
-        c = frame.get("claim") or {}
-        ng, fid, pk = c.get("nonce"), c.get("fleet_id"), c.get("pk")
-        if not (isinstance(ng, str) and isinstance(fid, str) and isinstance(pk, str)):
-            self._log("claim_malformed")
-            return
+        # Addressing: the claim must carry THIS window's public key.  The
+        # bus is broadcast, so a tell hears its siblings' ceremonies too;
+        # those are valid claims under another device's secret, and if they
+        # fed this node's failure counter a concurrent six-node ceremony
+        # would lock itself out (three sibling frames arrive within
+        # seconds, before this node's own claim is even delivered).
+        # A claim with a foreign pk can never verify here anyway: the
+        # proof is over the frame's own pk under this node's secret.
         if ng in self._seen_nonces:
             self._log("claim_ignored_replay")
             return
         self._remember_nonce(ng)
+        if self._session_pk is None or pk != self._session_pk.hex():
+            self._log("claim_ignored_foreign_pk")
+            return
         try:
             expect_parts = (b"claim", bytes.fromhex(ng), fid.encode(), bytes.fromhex(pk))
         except ValueError:
@@ -354,6 +389,8 @@ class Tell:
                                info=b"pair|" + ng_bytes + node_nonce + node_pk)
         self._pending_pair = {"pair_key": pair_key, "gateway_nonce": ng,
                               "fleet_id": fid}
+        self._pair_ctx = {"secret": self.device_secret, "ng": ng, "fid": fid,
+                          "pk": pk, "nonce": node_nonce, "pair_key": pair_key}
         ack = {"type": "CLAIM_ACK", "fleet_id": fid,
                "proof": mac_tag(self.device_secret, b"ack", node_nonce,
                                 ng_bytes).hex()}
@@ -368,35 +405,50 @@ class Tell:
         del self._seen_nonces[:-MAX_NONCE_CACHE]
 
     def _on_key(self, frame):
-        pp = self._pending_pair
-        if pp is None:
-            self._log("key_ignored")
-            return
         body = frame.get("key") or {}
         fid, kf = body.get("fleet_id"), body.get("fleet_key")
-        if fid != pp["fleet_id"] or not isinstance(kf, str):
+        if not isinstance(fid, str) or not isinstance(kf, str):
             self._log("key_bad")
             return
         try:
-            ng_bytes = bytes.fromhex(pp["gateway_nonce"])
             kf_bytes = bytes.fromhex(kf)
-            parts = (b"fleetkey", ng_bytes, fid.encode(), kf_bytes)
         except ValueError:
             self._log("key_bad")
             return
-        if not mac_ok(pp["pair_key"], parts, body.get("proof", "")):
-            self._claim_failures += 1
-            self._log("key_bad_proof")
+        ctx = self._pair_ctx
+        pp = self._pending_pair
+        if pp is not None and fid == pp["fleet_id"]:
+            ng_bytes = bytes.fromhex(pp["gateway_nonce"])
+            parts = (b"fleetkey", ng_bytes, fid.encode(), kf_bytes)
+            if not mac_ok(pp["pair_key"], parts, body.get("proof", "")):
+                self._claim_failures += 1
+                self._log("key_bad_proof")
+                return
+            self.fleet_id = fid
+            self.fleet_key = kf_bytes
+            self.device_secret = random_bytes(
+                self.world.stream(f"secret.{self.node_id}"), 16)  # consume the label (H1)
+            self._pending_pair = None
+            self.state = CLAIMED
+            self.peers.clear()      # unclaimed-era peers are stale
+            self._rotate_address()  # the MAC rotates at claim (H3)
+            self._log("claimed", fid)
+            self._send_keyack(fid, pp["pair_key"], ng_bytes)
             return
-        self.fleet_id = fid
-        self.fleet_key = kf_bytes
-        self.device_secret = random_bytes(
-            self.world.stream(f"secret.{self.node_id}"), 16)  # consume the label (H1)
-        self._pending_pair = None
-        self.state = CLAIMED
-        self.peers.clear()      # unclaimed-era peers are stale
-        self._rotate_address()  # the MAC rotates at claim (H3)
-        self._log("claimed", fid)
+        if ctx is not None and self.state == CLAIMED and fid == ctx["fid"]:
+            # Retransmitted KEY after we already installed: re-confirm.
+            ng_bytes = bytes.fromhex(ctx["ng"])
+            parts = (b"fleetkey", ng_bytes, fid.encode(), kf_bytes)
+            if mac_ok(ctx["pair_key"], parts, body.get("proof", "")) \
+                    and kf_bytes == self.fleet_key:
+                self._send_keyack(fid, ctx["pair_key"], ng_bytes)
+                return
+        self._log("key_ignored")
+
+    def _send_keyack(self, fid, pair_key, ng_bytes):
+        self.radio.broadcast(self.id, {
+            "type": "KEYACK", "fleet_id": fid,
+            "proof": mac_tag(pair_key, b"keyack", ng_bytes).hex()})
 
     # -- telemetry ------------------------------------------------------------
 

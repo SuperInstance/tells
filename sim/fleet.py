@@ -61,15 +61,38 @@ class Gateway:
         ng = random_bytes(self.world.stream(f"gw.{self.fleet_id}.nonce"), 16)
         pk = bytes.fromhex(label["pk"])
         proof = mac_tag(label["secret"], b"claim", ng, self.fleet_id.encode(), pk)
+        claim_frame = {"type": "CLAIM", "claim": {
+            "nonce": ng.hex(), "fleet_id": self.fleet_id, "pk": pk.hex(),
+            "proof": proof.hex()}}
         self.pending[node.node_id] = {
             "ng": ng, "nonce": label["nonce"], "pk": pk,
             "pair_key": hkdf_sha256(label["secret"],
                                     info=b"pair|" + ng + bytes.fromhex(label["nonce"]) + pk),
+            "confirmed": False, "claim_frame": claim_frame, "key_frame": None,
         }
-        self.radio.broadcast(self.id, {"type": "CLAIM", "claim": {
-            "nonce": ng.hex(), "fleet_id": self.fleet_id, "pk": pk.hex(),
-            "proof": proof.hex()}})
+        self.radio.broadcast(self.id, claim_frame)
+        # Frames get lost; the ceremony is completable by retransmission
+        # (the node re-acks replays of a claim it accepted -- see node.py).
+        self._schedule_retry(node.node_id, which="claim", attempts_left=5, delay=2.0)
         return True
+
+    def _schedule_retry(self, node_id, which, attempts_left, delay):
+        def _check():
+            entry = self.pending.get(node_id)
+            if entry is None or entry["confirmed"]:
+                return
+            if which == "claim" and entry["key_frame"] is not None:
+                return  # past the ack stage already
+            if attempts_left <= 0:
+                # Give up: leave the node unclaimed in the gateway's view.
+                self.pending.pop(node_id, None)
+                self.claimed.pop(node_id, None)
+                self.log.append((self.world.now, "ceremony_gave_up", node_id))
+                return
+            frame = entry[f"{which}_frame"]
+            self.radio.broadcast(self.id, frame)
+            self._schedule_retry(node_id, which, attempts_left - 1, delay)
+        self.world.schedule(delay, _check)
 
     def _issue_key(self, node_id, entry):
         if self.fleet_key is None:
@@ -78,11 +101,13 @@ class Gateway:
         kf = self.fleet_key
         proof = mac_tag(entry["pair_key"], b"fleetkey", entry["ng"],
                         self.fleet_id.encode(), kf)
-        self.radio.broadcast(self.id, {"type": "KEY", "key": {
+        entry["key_frame"] = {"type": "KEY", "key": {
             "fleet_id": self.fleet_id, "fleet_key": kf.hex(),
-            "proof": proof.hex()}})
+            "proof": proof.hex()}}
         self.claimed[node_id] = {"fleet_key": kf, "last_seq": 0}
         self.log.append((self.world.now, "key_issued", node_id))
+        self.radio.broadcast(self.id, entry["key_frame"])
+        self._schedule_retry(node_id, which="key", attempts_left=5, delay=2.0)
 
     # -- radio ----------------------------------------------------------------
 
@@ -90,6 +115,8 @@ class Gateway:
         kind = frame.get("type")
         if kind == "CLAIM_ACK":
             self._on_ack(frame)
+        elif kind == "KEYACK":
+            self._on_keyack(frame)
         elif kind == "BEACON":
             self.roster[frame.get("id")] = (self.world.now, frame)
         elif kind == "TELEMETRY":
@@ -104,10 +131,24 @@ class Gateway:
             expect = mac_tag(label["secret"], b"ack",
                              bytes.fromhex(entry["nonce"]), entry["ng"])
             if hmac.compare_digest(expect.hex(), proof):
-                self._issue_key(node_id, entry)
-                del self.pending[node_id]
+                if entry["key_frame"] is None:
+                    self._issue_key(node_id, entry)
+                else:
+                    self.radio.broadcast(self.id, entry["key_frame"])
                 return
         self.log.append((self.world.now, "ack_unverified", None))
+
+    def _on_keyack(self, frame):
+        proof = frame.get("proof", "")
+        for node_id, entry in self.pending.items():
+            if entry["key_frame"] is None or entry["confirmed"]:
+                continue
+            expect = mac_tag(entry["pair_key"], b"keyack", entry["ng"])
+            if hmac.compare_digest(expect.hex(), proof):
+                entry["confirmed"] = True
+                del self.pending[node_id]
+                self.log.append((self.world.now, "confirmed", node_id))
+                return
 
     def _on_telemetry(self, frame):
         # H5: telemetry is authenticated per-node and replay-windowed.

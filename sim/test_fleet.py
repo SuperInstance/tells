@@ -86,8 +86,14 @@ class TestClaimSafety(unittest.TestCase):
         press_button(w, target, hold_s=6.0, at=10.0)
         w.run(17.0)
         stranger = Stranger(w, bus)
+        # The realistic forged claim carries the target's OWN window pk --
+        # it is broadcast in the window-opening beacon, so any radio-range
+        # stranger has it.  (A claim with some other pk is a sibling's
+        # ceremony or noise: the node ignores it without feeding the H7
+        # failure counter, so a concurrent fleet ceremony cannot lock
+        # itself out.)
         for _ in range(3):
-            stranger.forged_claim(target_pk_hex="11" * 32)
+            stranger.forged_claim(target_pk_hex=target._session_pk.hex())
             w.run(w.now + 0.1)
         self.assertEqual(target.state, UNCLAIMED)
         self.assertTrue(target.events("claim_lockout"))
