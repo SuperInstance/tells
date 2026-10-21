@@ -14,7 +14,7 @@ code comments cite the sections they implement).
 
 ```sh
 cd sim
-python3 -m unittest discover -v   # full suite (58 tests, ~35 s)
+python3 -m unittest discover -v   # full suite (60 tests, ~45 s)
 python3 run_sim.py                # demo: both noise regimes + a lossy radio
 python3 run_sim.py --seed 42 --duration 7200
 python3 sweep.py                  # parameter sweep: SWEEP.md + sweep.csv
@@ -58,13 +58,20 @@ whose 95 % interval contained the truth). Calibration — coverage ≥
 95 % — is the pass criterion, not a bare error bound (review §4.8).
 
 The reported sigma is `sqrt(max(white-floor, measured-wander)² +
-const-bias-prior²)`: the white floor is `sigma_fix / sqrt(Σ lever²)`
-over the distinct fixes feeding the window (only baseline endpoints
-carry yaw lever — review §4.2), the wander term is measured from the
-estimator's own window-to-window scatter (Student-t inflated), and the
-constant multipath component is carried as a stated install-time prior
-because it is unidentifiable without a truth reference (review §4.3).
-Averaging can never talk the report below the floor.
+const-prior-floor²)`: the white floor comes from the estimator's own
+per-fix sensitivity coefficients — each fix's signed contribution
+through the per-node motion prediction into every epoch's yaw, and into
+the window mean, so fixes shared by overlapping tracks are never
+counted as independent information (review §4.2) — the wander term is
+measured from the estimator's own window-to-window scatter (Student-t
+inflated), and the quasi-constant per-node component (the bias OU plus
+the multipath OU, one unidentifiable offset over any window shorter
+than their correlation times) is carried as a stated install-time prior
+at its full scale, converted through the fit's linearized yaw
+sensitivity (review §4.3). Until 40 minutes of history exist (four
+windows — before the wander estimate can wake at all) the white floor
+additionally carries a 1.1× cold-start guard. Averaging can never talk
+the report below the floor.
 
 ## Fusion in one paragraph
 
@@ -95,5 +102,7 @@ The suite proves the three brief criteria and the review's additions:
   other out;
 - **compass** — common-mode cancels; the independent regime converges
   and is calibrated; the correlated regime floors while its report
-  carries the floor; heel is separated from yaw (paired same-seed
-  comparison); radio loss leaves gaps, not garbage; determinism.
+  carries the floor; cold-start coverage is pinned at the sweep's worst
+  cell (rho = 0.6, 15 m, 5 s); heel is separated from yaw (paired
+  same-seed comparison); radio loss leaves gaps, not garbage;
+  determinism.

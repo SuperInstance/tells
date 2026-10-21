@@ -19,11 +19,12 @@ multipath = 4 : 4 : 1 in variance; taus 1800/1800/14400 s):
     common_sigma=bias_sigma= 1.5 * sqrt(rho) * 2/3
     mult_sigma             = 1.5 * sqrt(rho) / 3
 
-The compass carries const_bias_prior_m = mult_sigma, the codebase's own
-convention (run_trial's correlated preset carries 0.4 m against a 0.4 m
-multipath): the install-time prior covers the multipath constant; the
-per-node bias OU is supposed to be caught by the measured-wander term,
-which needs four windows of history before it exists at all.
+The compass carries const_bias_prior_m = sqrt(bias^2 + mult^2) -- the
+install-time prior at the FULL quasi-constant scale (the post-fix
+convention: over any window shorter than the bias/multipath taus, the
+per-node bias OU and the multipath OU are one unidentifiable per-node
+offset, so the prior must cover both; the pre-fix convention covered
+multipath only, which the first sweep measured as the honesty gap).
 
 Each cell runs N seeded trials (default 24) of 10 simulated minutes,
 boat static at 42 deg, compass at design defaults (30 s epochs, 600 s
@@ -82,11 +83,12 @@ def run_sweep_trial(seed, baseline, interval, rho, duration=DURATION):
     sigma_white = SIGMA_FIX * math.sqrt(1.0 - rho)
     common = bias = SIGMA_FIX * math.sqrt(rho) * (2.0 / 3.0)
     mult = SIGMA_FIX * math.sqrt(rho) / 3.0
+    full = math.sqrt(bias * bias + mult * mult)
     errors = ErrorModel(world, sigma_white=sigma_white,
                         common_sigma=common, common_tau=1800.0,
                         bias_sigma=bias, bias_tau=1800.0,
                         mult_sigma=mult, mult_tau=14400.0)
-    compass = Compass(layout, const_bias_prior_m=mult)
+    compass = Compass(layout, const_bias_prior_m=full)
     for nid in layout:
         GPSPayload(nid, truth, errors, world, sink=compass.ingest,
                    interval=interval)
