@@ -1,0 +1,19 @@
+Review written to [REVIEW-MCODE.md](/home/casey/tells/REVIEW-MCODE.md) (845 lines). `DESIGN.md` verified unmodified (`git diff --quiet` clean).
+
+## What the review found
+
+**1. Claim ceremony — the button window is necessary but not sufficient.** It converts the attacker from radio-range to physical-possession (without it, first-claim-wins is first-random-device-wins). But it gates *when*, not *who*: the key exchange is unauthenticated and replayable, and §7 lists it as an open question while §3 depends on it. Nine holes documented — most consequentially: **ESP-NOW cannot encrypt broadcasts at all** ("Encrypting multicast vendor-specific action frame is not supported"), so §3's "switch to encrypted peer links" never covers the beacons; **"node ID (MAC-derived)" and "fleet hash" leak identity in the clear forever**; **telemetry is unauthenticated, so a stranger can inject fake GPS fixes and steer the compass**; and the 5 s/15 s button states are ambiguous.
+
+**2. Thirty nodes is a peer-table and power problem, not a discovery problem.** ESP-NOW holds **20 peers (17 encrypted)** — a 30-node all-to-all mesh returns `ESP_ERR_ESPNOW_FULL`. Beacon airtime at the design's rates is 0.05% of channel, so collisions are a non-issue; the storm is *gossip* (re-gossiped observations amplify to ~900 transmissions/event, no TTL or sequence numbers). And **a generic laptop cannot speak ESP-NOW**, so the gateway needs a real ESP32 radio — whose channel then collides with its own Wi-Fi uplink.
+
+**3. December budget does not close as written — and the binding constraint isn't insolation.** Radio *receive* is 99.8% of the budget (§4's "GPS is the hungry part" is wrong by two orders of magnitude; its correct "whispering is cheap" observation is beside the point). But the real killer is chemistry: **Anchorage's December daily maximum is −3.9 °C (NOAA 1991–2020), so LiFePO₄ cannot be charged at all for ~120 days/year**, and a 2 W panel (0.12 W at noon) cannot warm a cell against 0.25 W of convective loss. It closes comfortably *after* the fixes — 3.9 mWh/day survival tier, 0.47 Wh over the whole dark season — but only with an autonomous voltage-triggered ladder and a GNSS backup cell (without it, every fix is a 26 s cold start: GNSS term goes up **26×**). §7's "solar sizing from December data" is aimed at the wrong input.
+
+**4. Compass math: the claim is roughly right for the wrong reasons, and the honesty requirement is unsatisfiable as written.** `σ_fix/baseline` omits a √2 (8.10°, not 5.73°); six collinear tells buy only 1.18× over the best pair, not √6; the 1/√N averaging assumes white noise when the dominant error is a per-node bias that doesn't average down — Monte Carlo (1500 trials) shows the naive reported σ understating truth by up to **9× at N=300**. Heel of 5° puts 5° of bias into any athwartships baseline; 30 s of epoch skew at 3 m/s puts 80° into one. So heading must come from the longitudinal bow–stern baseline only (Kabsch fit), fixes must be time-aligned to a common epoch, and underway **Doppler relative velocity is 20–40× better than position differencing** (0.19° vs 8.10°).
+
+**26 ranked fixes** (8 critical / 10 major / 8 minor), 12 numbered assumptions, a "could not verify" section, and a tested Appendix A script that reproduces every number.
+
+**Cheapest three wins:** a coin cell on the GNSS VBAT pin (cents, 26× on the largest term); a slotted sync epoch instead of continuous reception (6.985 → 0.050 Wh/day *and* fits inside the peer limit); a rigid-body fit with a reported bias floor.
+
+One correction to note: my first appendix draft had identical `common`/`independent`branches that contradicted the §4.3 table — fixed and re-verified against the source run.
+
+File: /home/casey/tells/REVIEW-MCODE.md

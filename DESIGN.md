@@ -95,3 +95,26 @@ open after a physical press; first-claim-wins + button reset as recovery.)
   free — a rare luxury; non-GPS payloads need a gossip clock).
 - Store-and-forward when the gateway is absent for days.
 - Solar sizing from real December data at Casey's latitude.
+
+## v0.1 amendments (post-review, 2026-10-20)
+
+Geordi's hard review (REVIEW-MCODE.md) landed real hits on v0. Until a v1
+rewrite, these amendments govern:
+
+- **Compass math corrected.** The §5 noise formula was wrong by a factor of
+  √2 (REVIEW §4.1), and the "averaging tightens as 1/√N" claim is **withdrawn
+  as stated**: co-located GPS receivers share correlated errors (atmosphere,
+  multipath, constellation geometry), so averaging buys far less than the
+  independent-error math promises (REVIEW §4.3). Any simulator that models
+  fix noise as independent per node will "prove" a falsehood — the sim must
+  model a correlated error component (REVIEW §4.8). Six collinear nodes are
+  also not six independent baselines (§4.2), heel/pitch and fix-epoch skew
+  belong in the model (§4.4), and underway the primary observable changes
+  (§4.5).
+- **December power budget does NOT close as specified.** The decisive factor
+  is the cold-charge constraint (a frozen battery cannot accept charge),
+  ahead of panel wattage (REVIEW §3.3–3.4). Fixes and a reframed budget are
+  in §3.4–3.6; treat §4 above as targets under revision, not a closed budget.
+- **Claim ceremony: button window is necessary, not sufficient.** The §3
+  sketch is superseded by the ceremony in REVIEW §1.4; the holes are
+  catalogued in §1.3 (claim races, replay, and stranger-pre-claim among them).
