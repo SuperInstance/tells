@@ -294,5 +294,47 @@ class TestGeometryAndGaps(unittest.TestCase):
                          [r.as_tuple() for r in b[0]])
 
 
+class TestColdStartHonesty(unittest.TestCase):
+    """BRIEF-COMPASS-FIX regression: the first sweep measured the
+    cold-start honesty gap -- pooled coverage 71-91 % at rho >= 0.3 and
+    1-5 s fix intervals, because the install-time prior covered the
+    multipath constant only: the per-node bias OU is quasi-frozen for
+    tens of minutes, so neither the (never-awake) wander term nor the
+    prior carried it, and reported sigma sat at 49-58 % of the true
+    error scale.  The fix carries the prior at the full quasi-constant
+    scale sqrt(bias^2 + mult^2) with sensitivity-derived floors.  These
+    tests pin the coverage property at the brief's named cell
+    (rho = 0.6, 15 m baseline, 5 s fix interval): nominal 95 %, honest
+    band 90-99 %, and never the absurd conservatism that is the other
+    failure mode."""
+
+    @staticmethod
+    def _cell_stats():
+        from sweep import run_sweep_trial
+        hits, errs, sigmas = [], [], []
+        for seed in range(1000, 1032):
+            tr = run_sweep_trial(seed, 15.0, 5.0, 0.6)
+            hits.extend(tr["hits"])
+            errs.extend(tr["errs"])
+            sigmas.append(tr["sigma_final"])
+        return hits, errs, sigmas
+
+    def test_coverage_is_calibrated_at_the_brief_cell(self):
+        hits, _errs, _sigmas = self._cell_stats()
+        cov = sum(hits) / len(hits)
+        self.assertGreaterEqual(cov, 0.90)
+        self.assertLessEqual(cov, 0.99)
+
+    def test_reported_sigma_tracks_true_error_scale(self):
+        # The old failure mode in one number: sigma_final 2.22 deg against
+        # an err p90 of 5.50 deg (ratio 0.66 to the p90/1.645 error-sd
+        # estimate).  A calibrated report sits near 1.
+        hits, errs, sigmas = self._cell_stats()
+        err_sd = statistics.quantiles(errs, n=10, method="inclusive")[8] / 1.645
+        ratio = statistics.median(sigmas) / err_sd
+        self.assertGreaterEqual(ratio, 0.75)
+        self.assertLessEqual(ratio, 1.5)
+
+
 if __name__ == "__main__":
     unittest.main()
