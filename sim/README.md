@@ -17,6 +17,7 @@ cd sim
 python3 -m unittest discover -v   # full suite (58 tests, ~35 s)
 python3 run_sim.py                # demo: both noise regimes + a lossy radio
 python3 run_sim.py --seed 42 --duration 7200
+python3 sweep.py                  # parameter sweep: SWEEP.md + sweep.csv
 ```
 
 ## Modules
@@ -29,6 +30,7 @@ python3 run_sim.py --seed 42 --duration 7200
 | `fleet.py` | gateway + claim ceremony (possession + secret + freshness), stranger model |
 | `compass.py` | fix generation, error model, fusion: heading + honest sigma |
 | `run_sim.py` | the demo |
+| `sweep.py` | the parameter sweep (baseline × fix interval × correlated-error fraction → `SWEEP.md` + `sweep.csv`) |
 
 ## What the demo's numbers mean
 
