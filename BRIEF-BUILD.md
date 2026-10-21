@@ -15,3 +15,12 @@ in ~/tells/sim/ :
   a few degrees and reported uncertainty is honest vs. measured error.
 - Small commits as you go. A short sim/README.md explaining how to run it.
 - Print a summary when done: files, test results, measured compass accuracy.
+
+## ADDENDUM (2026-10-20, post-review — binding)
+REVIEW-MCODE.md §4.8 governs the compass work: fix noise must include a
+**correlated error component** shared by co-located nodes (atmosphere /
+multipath / geometry), not independent noise only — an independent-only sim
+proves a falsehood. Report heading accuracy separately for the independent
+and correlated regimes, and make the reported uncertainty reflect the regime.
+Also: drive ZCode in --mode yolo on this box (build mode's Write gate is
+unconfigured here).
