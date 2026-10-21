@@ -22,12 +22,17 @@ REVIEW-MCODE SS4 governs this file; the binding points:
     transform is estimated from contemporaneous (aligned) positions; only
     the heading is time-averaged.
 
-  SS4.3    -- reported sigma = sqrt(max(white-model, measured-wander)^2 +
-    const-bias-prior^2): a floor, so averaging can never talk the
-    uncertainty below what per-node bias permits.  The constant component
-    (multipath constant over a run) is unidentifiable without a truth
-    reference, so it is carried as an install-time prior -- stated, not
-    smuggled.
+  SS4.3    -- reported sigma = sqrt(white^2 + const-prior-floor^2) (with
+    the measured-wander term replacing white once enough history exists):
+    a floor, so averaging can never talk the uncertainty below what
+    per-node bias permits.  The constant component (the quasi-constant
+    part of the per-node bias OU plus the multipath OU -- over any window
+    shorter than their correlation times they are one unidentifiable
+    offset) is carried as an install-time prior at its FULL scale --
+    stated, not smuggled.  Both floors come from the estimator's own
+    linearized sensitivities (the 2-D weighted-Procrustes coefficients),
+    not hand factors: the sweep showed hand factors are dishonest in
+    both directions across the parameter grid.
 """
 
 import math
@@ -381,15 +386,17 @@ def _t95(k):
 
 
 class _Epoch:
-    __slots__ = ("t", "yaw", "s_layout", "fix_contrib", "n_nodes", "info")
+    __slots__ = ("t", "yaw", "s_layout", "fix_coef", "node_coef", "n_nodes",
+                 "info")
 
-    def __init__(self, t, yaw, s_layout, fix_contrib, n_nodes, info):
+    def __init__(self, t, yaw, s_layout, fix_coef, node_coef, n_nodes, info):
         self.t = t
         self.yaw = yaw
         self.s_layout = s_layout
-        self.fix_contrib = fix_contrib   # {(node, fix_t): lever^2 / var}
+        self.fix_coef = fix_coef       # {(node, fix_t): rad of yaw error per m of fix noise}
+        self.node_coef = node_coef     # {node: rad of yaw error per m of quasi-const offset}
         self.n_nodes = n_nodes
-        self.info = info                 # total yaw information of the epoch
+        self.info = info               # total yaw information of the epoch
 
 
 class Reading:
@@ -412,8 +419,16 @@ class Reading:
 
 class Compass:
     def __init__(self, layout, epoch_s=30.0, window_s=600.0, freshness_s=150.0,
-                 const_bias_prior_m=0.0, history_windows=6.0, cold_infl=1.6,
+                 const_bias_prior_m=0.0, history_windows=6.0, cold_infl=1.1,
                  max_skew_s=90.0, vel_prior_mps=0.05):
+        """const_bias_prior_m is the install-time per-axis scale of the
+        QUASI-CONSTANT per-node differential error (bias OU + multipath OU
+        at full scale, SS4.3): over any window shorter than their
+        correlation times these are one unidentifiable offset, carried as
+        a stated prior.  cold_infl guards the cold-start white floor (the
+        wander term needs 4 windows = 40 min of history before it exists;
+        until then the white model's second-order gaps are covered by this
+        factor, measured ~1.0-1.1x)."""
         self.layout = dict(layout)
         self.epoch_s = epoch_s
         self.window_s = window_s
@@ -445,17 +460,23 @@ class Compass:
         (SS4.6's process model; this is the at-anchor estimator of
         SS4.5 -- a boat's swing rates are ~1e-4 rad/s, so a slope built
         from two noisy fixes is noise, not motion).  lam = (sigma_fix /
-        sigma_v_prior)^2.  Returns (pos, var_factor) with var_factor the
-        prediction variance in units of sigma_fix^2, computed from the
-        exact effective weights on the fixes (they sum to 1, so a
-        per-node bias passes through undamped -- the floor survives)."""
+        sigma_v_prior)^2.  Returns (pos, var_factor, fix_ws) with
+        var_factor the prediction variance in units of sigma_fix^2 and
+        fix_ws the exact effective weight of each track fix in the
+        prediction (they sum to 1, so a per-node bias passes through
+        undamped -- the floor survives), keyed by fix time in
+        _aligned; the white floor integrates these weights across
+        epochs honestly (adjacent epochs share track fixes, so their
+        prediction errors are correlated)."""
         k = len(track)
         if k == 1:
-            return list(track[0][1]), 1.0
+            return list(track[0][1]), 1.0, [(track[0][0], 1.0)]
         tbar = sum(f[0] for f in track) / k
         stt = sum((f[0] - tbar) ** 2 for f in track)
         if stt <= 1.0:
-            return list(track[-1][1]), 1.0
+            ws = [(f[0], 1.0 if i == k - 1 else 0.0)
+                  for i, f in enumerate(track)]
+            return list(track[-1][1]), 1.0, ws
         denom = stt + lam
         dt = t - tbar
         ws = [1.0 / k + (f[0] - tbar) * dt / denom for f in track]
@@ -465,13 +486,14 @@ class Compass:
             pbar = sum(f[1][i] for f in track) / k
             v = sum((f[0] - tbar) * (f[1][i] - pbar) for f in track) / denom
             out.append(pbar + v * dt)
-        return out, var
+        fix_ws = [(f[0], w) for f, w in zip(track, ws)]
+        return out, var, fix_ws
 
     def _aligned(self, t):
-        """Per-node state at epoch t as {node: (pos, var_factor)}, from
-        fixes no older than freshness_s.  A node whose latest fix is older
-        than max_skew_s is a GAP for this epoch (SS4.8.6): it sits out
-        rather than being projected many slot-times along a velocity
+        """Per-node state at epoch t as {node: (pos, var_factor, fix_ws)},
+        from fixes no older than freshness_s.  A node whose latest fix is
+        older than max_skew_s is a GAP for this epoch (SS4.8.6): it sits
+        out rather than being projected many slot-times along a velocity
         estimated from noisy fixes -- radio loss must shorten the
         baseline, never corrupt it."""
         out = {}
@@ -507,8 +529,6 @@ class Compass:
         info = sum(weights)
         if info <= 0.0:
             return None  # no endpoint survived: heading is a gap this epoch
-        fix_contrib = {(nid, self.tracks[nid][-1][0]): w
-                       for nid, w in zip(nids, weights)}
         body = [self.layout[nid] for nid in nids]
         world_pts = [aligned[nid][0] for nid in nids]
         if len(nids) >= 3:
@@ -521,7 +541,24 @@ class Compass:
             fore, aft = (nids[1], nids[0]) if xs[1] > xs[0] else (nids[0], nids[1])
             yaw = math.atan2(aligned[fore][0][0] - aligned[aft][0][0],
                              aligned[fore][0][1] - aligned[aft][0][1])
-        ep = _Epoch(t, yaw, s_layout, fix_contrib, len(nids), info)
+        # Sensitivity of this epoch's yaw to error, from the 2-D weighted
+        # Procrustes linearization: d(yaw)/d(node i's lateral offset) has
+        # magnitude w_i * r_i / sum_j(w_j * r_j^2) with r_i the node's
+        # 2-D radius sqrt(x^2+y^2) -- the athwartships spread dilutes yaw
+        # sensitivity, which the old sqrt(2)/sqrt(sum lever^2) hand factor
+        # ignored (the sweep measured it 0.80-0.97 across baselines).
+        wr2 = sum(w * (self.layout[nid][0] ** 2 + self.layout[nid][1] ** 2)
+                  for nid, w in zip(nids, weights))
+        fix_coef = {}
+        node_coef = {}
+        if wr2 > 0.0:
+            for nid, w in zip(nids, weights):
+                x, y, _ = self.layout[nid]
+                d = w * math.hypot(x, y) / wr2
+                node_coef[nid] = d
+                for ft, wj in aligned[nid][2]:
+                    fix_coef[(nid, ft)] = d * wj
+        ep = _Epoch(t, yaw, s_layout, fix_coef, node_coef, len(nids), info)
         self.history.append(ep)
         cut = t - self.window_s * self.history_windows
         self.history = [e for e in self.history if e.t >= cut]
@@ -529,26 +566,55 @@ class Compass:
 
     # -- reporting ------------------------------------------------------------
 
-    def _white_floor(self, t):
-        """Model white term: sigma_fix / sqrt(sum of lever-arm-squared over
-        the DISTINCT fixes feeding this window) (SS4.2)."""
-        contribs = {}
-        for ep in self.history:
-            if ep.t > t - self.window_s:
-                for key, c in ep.fix_contrib.items():
-                    contribs.setdefault(key, c)
-        s_dist = sum(contribs.values())
-        if s_dist <= 0.0:
-            return None
-        return self._sigma_fix / math.sqrt(s_dist) * R2D
+    def _win_weights(self, t):
+        """Window epochs and their information weights in the reported
+        (circular-mean) heading: ([epochs], [a_e] summing to 1)."""
+        win = [e for e in self.history if e.t > t - self.window_s]
+        if not win:
+            return [], []
+        tot = sum(e.info for e in win)
+        if tot <= 0.0:
+            return [], []
+        return win, [e.info / tot for e in win]
 
-    def _const_floor(self):
-        """Carried prior for the constant per-node component (SS4.3):
-        sqrt(2) * prior / lever arm of the CURRENT geometry."""
-        if self.const_bias_prior_m <= 0.0 or not self.history:
+    def _white_floor(self, t):
+        """Honest white term: sigma_fix times the L2 norm of the window
+        mean's total coefficient on each DISTINCT fix (SS4.2).  A fix
+        shared by several epochs' predictions (overlapping fresh tracks)
+        accumulates its coefficients across those epochs before squaring
+        -- the epochs' white errors are correlated through shared fixes,
+        and counting fixes as if independent understates the floor by
+        1.1-1.7x across fix intervals (measured, BRIEF-SWEEP post-fix
+        probe)."""
+        win, a = self._win_weights(t)
+        if not win:
+            return None
+        acc = {}
+        for e, ae in zip(win, a):
+            for key, c in e.fix_coef.items():
+                acc[key] = acc.get(key, 0.0) + ae * c
+        return self._sigma_fix * math.sqrt(sum(c * c for c in acc.values())) * R2D
+
+    def _const_floor(self, t):
+        """Carried prior for the quasi-constant per-node component
+        (SS4.3): the prior (per-axis scale of the bias+multipath OUs,
+        which over any window shorter than their taus is one
+        unidentifiable per-node offset) times the window mean's
+        accumulated per-node yaw sensitivity.  A quasi-const offset
+        passes through every epoch's prediction undamped (fix weights
+        sum to 1), so the coefficients add across the window before
+        squaring."""
+        if self.const_bias_prior_m <= 0.0:
             return 0.0
-        return math.sqrt(2.0) * self.const_bias_prior_m / math.sqrt(
-            self.history[-1].s_layout) * R2D
+        win, a = self._win_weights(t)
+        if not win:
+            return 0.0
+        acc = {}
+        for e, ae in zip(win, a):
+            for nid, d in e.node_coef.items():
+                acc[nid] = acc.get(nid, 0.0) + ae * d
+        return self.const_bias_prior_m * math.sqrt(
+            sum(d * d for d in acc.values())) * R2D
 
     def _wander(self, t):
         """Measured slow wander of window means (the OU-bias part of the
@@ -583,10 +649,15 @@ class Compass:
         white = self._white_floor(t)
         if white is None:
             return None
-        floor_const = self._const_floor()
+        floor_const = self._const_floor(t)
         sigma_emp, k = self._wander(t)
         if sigma_emp is None:
-            # Cold start: no wander estimate yet -- be conservative.
+            # Cold start: the wander estimate needs 4 windows of history
+            # (40 min at window_s = 600) before it exists at all, and the
+            # quasi-const floor already carries the bias+multipath prior
+            # at full scale -- the cold inflation is only the guard band
+            # for the white model's second-order gaps (measured residual
+            # ~1.0-1.1x), never a substitute for the missing prior.
             sigma = math.sqrt((white * self.cold_infl) ** 2 + floor_const ** 2)
         else:
             sigma = math.sqrt(max(white, sigma_emp) ** 2 + floor_const ** 2)
@@ -623,7 +694,15 @@ def run_trial(seed, regime="independent", duration=5400.0, heading_deg=42.0,
                       pitch_amp_deg=pitch_amp_deg, heave_amp_m=heave_amp_m)
     if regime == "correlated":
         errors = ErrorModel.correlated(world, sigma_white=sigma_white)
-        prior = 0.4 if const_bias_prior_m is None else const_bias_prior_m
+        # Prior at the FULL quasi-constant scale (SS4.3): over any window
+        # shorter than their taus, the per-node bias OU (0.8 m) and the
+        # multipath OU (0.4 m) are one unidentifiable per-node offset of
+        # per-axis scale sqrt(0.8^2 + 0.4^2) ~ 0.89 m.  The old convention
+        # (multipath only, 0.4 m) was the sweep-measured honesty gap: the
+        # bias OU is quasi-frozen for tens of minutes, so nothing measured
+        # catches it inside a short run.
+        prior = math.sqrt(0.8 ** 2 + 0.4 ** 2) if const_bias_prior_m is None \
+            else const_bias_prior_m
     else:
         errors = ErrorModel.independent(world, sigma_white=sigma_white)
         prior = 0.0 if const_bias_prior_m is None else const_bias_prior_m
